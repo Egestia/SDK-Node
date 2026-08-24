@@ -13,6 +13,11 @@ npm install @egestia/sdk
 
 Requiere Node 18 o superior (usa `fetch` nativo). No trae dependencias.
 
+> **¿Cómo funciona por dentro?** En [`docs/`](docs/) está la mecánica:
+> [arquitectura](docs/arquitectura.md), [reintentos y folios](docs/reintentos-y-folios.md),
+> [estados](docs/estados.md), [problemas](docs/problemas.md),
+> [la API por debajo](docs/api-publica.md) y [recetas](docs/recetas.md).
+
 ## Empezar
 
 La API key se genera en **Egestia → Integraciones** y empieza con `egst_`.
