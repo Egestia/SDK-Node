@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  prueba:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 18 es el mínimo que declara el paquete: si se rompe ahí, se rompe
+        # para quien todavía no migra.
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+      - run: npm test

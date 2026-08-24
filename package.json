@@ -1,0 +1,53 @@
+{
+  "name": "@egestia/sdk",
+  "version": "1.0.0",
+  "description": "Cliente oficial de la API pública de Egestia: emitir boletas y facturas electrónicas y consultar su estado.",
+  "license": "MIT",
+  "author": "Egestia",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Egestia/SDK-Node.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Egestia/SDK-Node/issues"
+  },
+  "homepage": "https://github.com/Egestia/SDK-Node#readme",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/cjs.mjs",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run build",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "egestia",
+    "dte",
+    "boleta",
+    "factura",
+    "sii",
+    "chile"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
