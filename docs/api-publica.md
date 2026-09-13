@@ -130,6 +130,22 @@ devuelve la nota existente con `repetido: true`.
 }
 ```
 
+## La sucursal, cuando hay más de una tienda online
+
+Las llamadas que miran o mueven stock aceptan `branchId`. Si no viene, Egestia
+usa **la sucursal marcada como tienda online**.
+
+Mientras haya una sola, no hay que mandar nada. Con dos o más, la llamada
+responde **422** pidiendo la sucursal, porque adivinar de qué bodega descontar es
+peor que preguntar: se vendería de un stock que no es.
+
+```json
+{ "error": "Hay más de una sucursal de tienda online: indica branchId." }
+```
+
+El mismo `branchId` es el que factura, así que los reportes por sucursal
+muestran cada venta donde corresponde.
+
 ## Errores
 
 | Código | Significa |
