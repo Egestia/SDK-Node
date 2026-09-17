@@ -118,6 +118,75 @@ const { anulado, emitido } = await egestia.documentos.anularYReemitir(
 );
 ```
 
+## Pagarle a un prestador: emitir y transferir el líquido
+
+El orden importa. Primero se emite —ahí el SII dice cuánto se retiene— y recién
+después se transfiere, porque hasta que la boleta no existe no se sabe el monto.
+
+```ts
+export async function pagarHonorario(pago) {
+  const r = await egestia.honorarios.intentarEmitir({
+    rut: pago.prestador.rut,
+    nombre: pago.prestador.nombre,
+    bruto: pago.montoAcordado,       // el BRUTO. La retención la pone el SII
+    referencia: pago.id,             // la llave de todo
+    origen: 'pagos',
+    descripcion: pago.glosa,
+    sucursal: pago.sucursal,         // a qué centro de costo se carga
+  });
+
+  if (!r.ok) {
+    // `en_curso`: hay otra llamada emitiendo esta misma referencia ahora mismo.
+    // No emitas otra: deja que la cola lo reintente.
+    if (r.problema.reintentable) throw new Error(r.problema.mensaje);
+
+    await avisarAlEquipo(r.problema.tipo, r.problema.mensaje, r.problema.queHacer);
+    return null;
+  }
+
+  const boleta = r.datos;
+
+  // Ya existía: esta llamada no emitió nada. Si la transferencia de ese pago ya
+  // salió, no vuelve a salir.
+  if (boleta.repetido && pago.transferenciaId) return boleta;
+
+  await pago.guardar({
+    boletaId: boleta.id,
+    folio: boleta.folio,
+    bruto: boleta.grossAmount,
+    retenido: boleta.withheldAmount,   // esto lo entera la empresa al SII
+    liquido: boleta.netAmount,
+  });
+
+  // Lo que se transfiere es el LÍQUIDO. Transferir el bruto es pagar la
+  // retención dos veces: una al prestador y otra al fisco.
+  await transferir({ rut: boleta.issuer.rut, monto: boleta.netAmount, glosa: `Boleta ${boleta.folio}` });
+
+  return boleta;
+}
+```
+
+### Si la transferencia falla después de emitir
+
+La boleta ya existe en el SII y no hay que reemitirla. Se reintenta **sólo la
+transferencia**, y el monto se lee de la boleta, no se recalcula:
+
+```ts
+const boleta = await egestia.honorarios.buscarPorReferencia(pago.id, { origen: 'pagos' });
+if (boleta && boleta.status === 'vigente') {
+  await transferir({ rut: boleta.issuer.rut, monto: boleta.netAmount, glosa: `Boleta ${boleta.folio}` });
+}
+```
+
+### Si el pago se cae antes de transferir
+
+```ts
+await egestia.honorarios.anular(boleta.id, { causa: 'no_prestacion' });
+```
+
+Si ya se transfirió, anular **no** devuelve la plata: la boleta queda anulada
+ante el SII y el reembolso se gestiona aparte.
+
 ## Avisar antes de quedarse sin folios
 
 Un trabajo diario que evita el peor día del mes:

@@ -15,6 +15,8 @@ export type TipoProblema =
   | 'configuracion' // falta algo en Egestia: SII o certificado
   | 'sin_folios'    // se acabó el CAF de ese tipo de documento
   | 'ya_aceptado'   // el SII ya lo recibió: no admite correcciones
+  | 'ya_emitida'    // esa referencia ya emitió boleta de honorarios, por otro monto
+  | 'en_curso'      // la misma referencia se está emitiendo ahora mismo
   | 'sii'           // el SII rechazó o no contestó
   | 'red'           // no llegó
   | 'no_encontrado' // el id o la referencia no existen en ese cliente
@@ -54,7 +56,13 @@ export interface Problema {
 }
 
 /** Frases de Egestia que tienen una causa concreta y una salida concreta. */
-const CAUSAS: Array<{ busca: RegExp; tipo: TipoProblema; queHacer: string }> = [
+const CAUSAS: Array<{
+  busca: RegExp;
+  tipo: TipoProblema;
+  queHacer: string;
+  /** Cuando el código HTTP por sí solo no dice si insistir sirve. */
+  reintentable?: boolean;
+}> = [
   {
     busca: /Configure la empresa SII/i,
     tipo: 'configuracion',
@@ -72,6 +80,13 @@ const CAUSAS: Array<{ busca: RegExp; tipo: TipoProblema; queHacer: string }> = [
       'Se acabaron los folios de ese tipo de documento. Hay que pedir un CAF nuevo al SII y cargarlo en ' +
       'Egestia (SII → Folios/CAF). Hasta entonces no se puede emitir ese tipo: la venta queda registrada ' +
       'en borrador y se emite sola al reintentar. Con `egestia.folios()` puedes avisar antes de quedarte sin.',
+  },
+  {
+    busca: /clave tributaria/i,
+    tipo: 'configuracion',
+    queHacer:
+      'El cliente no tiene cargada su clave tributaria del SII, y sin ella no se pueden emitir boletas ' +
+      'de honorarios. Se configura en Egestia → Configuración → SII → Certificado Digital.',
   },
   {
     busca: /certificad/i,
@@ -92,6 +107,52 @@ const CAUSAS: Array<{ busca: RegExp; tipo: TipoProblema; queHacer: string }> = [
     busca: /rechaz|reparo/i,
     tipo: 'sii',
     queHacer: 'El SII rechazó el documento. Revisa el detalle en `sii` y corrige antes de reemitir.',
+  },
+
+  // ── Boletas de honorarios ──────────────────────────────────────────────────
+  {
+    busca: /ya emitió una boleta por/i,
+    tipo: 'ya_emitida',
+    queHacer:
+      'Esa referencia ya emitió una boleta, y por OTRO monto: no es un reintento, es otro pago con la ' +
+      'referencia equivocada. La boleta que ya existe viene en `detalle.data`. Si el monto anterior ' +
+      'estaba malo, anúlala con `honorarios.anular(id, { causa: "error_digitacion" })` y emite otra ' +
+      'con una referencia nueva.',
+  },
+  {
+    busca: /Ya se está emitiendo la boleta/i,
+    tipo: 'en_curso',
+    queHacer:
+      'Otra llamada con esta misma referencia está emitiendo ahora mismo. No emitas otra: espera unos ' +
+      'segundos y pregunta con `honorarios.buscarPorReferencia(tuReferencia)`.',
+    reintentable: true,
+  },
+  {
+    busca: /domicilio|la comuna/i,
+    tipo: 'validacion',
+    queHacer:
+      'El SII imprime el domicilio y la comuna del prestador en la boleta y sin ellos la rechaza. ' +
+      'Complétalos en su ficha de contacto en Egestia, o mándalos en `direccion` y `comuna`.',
+  },
+  {
+    busca: /causa tiene que ser una de las dos/i,
+    tipo: 'validacion',
+    queHacer:
+      'El SII acepta dos causas de anulación y no más: «no_prestacion» si el servicio no se prestó, ' +
+      '«error_digitacion» si la boleta salió con un dato malo.',
+  },
+  {
+    busca: /Sólo se anulan las boletas que emitió la empresa/i,
+    tipo: 'validacion',
+    queHacer: 'Una boleta recibida la anula quien la emitió: desde acá no se puede.',
+  },
+  {
+    busca: /No hay conexión con apibase|no se puede consultar al SII/i,
+    tipo: 'sii',
+    queHacer:
+      'Egestia no pudo llegar al SII. No se emitió nada, así que reintentar es seguro —con la misma ' +
+      'referencia— en unos minutos.',
+    reintentable: true,
   },
 ];
 
@@ -127,7 +188,7 @@ export function explicar(error: unknown): Problema {
       tipo: causa?.tipo ?? 'validacion',
       mensaje: error.message,
       queHacer: causa?.queHacer ?? 'Corrige los datos: repetir la misma petición dará lo mismo.',
-      reintentable: false,
+      reintentable: causa?.reintentable ?? false,
       status: error.status,
       detalle: error.details,
     };
@@ -148,7 +209,10 @@ export function explicar(error: unknown): Problema {
     return {
       tipo: 'scope',
       mensaje: error.message,
-      queHacer: 'A la API key le falta el scope de esa operación. Para emitir y anular hace falta «documents».',
+      queHacer:
+        'A la API key le falta el scope de esa operación: «documents» para boletas y facturas, ' +
+        '«honorarios» para las boletas de honorarios de terceros. Se marcan al crear la key en ' +
+        'Egestia → Integraciones.',
       reintentable: false,
       status: 403,
       detalle: error.details,
@@ -160,8 +224,9 @@ export function explicar(error: unknown): Problema {
       tipo: 'red',
       mensaje: error.message,
       queHacer:
-        'No hubo respuesta, así que no se sabe si la venta se facturó. ' +
-        'Antes de reintentar, pregunta con `documentos.buscarPorReferencia(tuReferencia)`.',
+        'No hubo respuesta, así que no se sabe si la venta se facturó. Antes de reintentar, pregunta ' +
+        'con `documentos.buscarPorReferencia(tuReferencia)` —o `honorarios.buscarPorReferencia(…)` ' +
+        'si era una boleta de honorarios—.',
       reintentable: true,
       status: 0,
       detalle: error.details,
@@ -207,7 +272,10 @@ export function explicar(error: unknown): Problema {
       queHacer: causa?.queHacer ?? (error.retriable
         ? 'Falla del lado de Egestia. Se puede reintentar en unos segundos.'
         : 'Revisa el detalle de la respuesta.'),
-      reintentable: error.retriable,
+      // El código HTTP no siempre alcanza: un 409 «se está emitiendo ahora
+      // mismo» se resuelve solo, y volver a preguntar es exactamente lo que
+      // hay que hacer.
+      reintentable: causa?.reintentable ?? error.retriable,
       status: error.status,
       detalle: error.details,
     };

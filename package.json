@@ -1,7 +1,7 @@
 {
   "name": "@egestia/sdk",
-  "version": "1.0.0",
-  "description": "Cliente oficial de la API pública de Egestia: emitir boletas y facturas electrónicas y consultar su estado.",
+  "version": "1.1.0",
+  "description": "Cliente oficial de la API pública de Egestia: emitir boletas, facturas y boletas de honorarios electrónicas y consultar su estado.",
   "license": "MIT",
   "author": "Egestia",
   "repository": {
@@ -41,6 +41,8 @@
     "dte",
     "boleta",
     "factura",
+    "honorarios",
+    "bhte",
     "sii",
     "chile"
   ],

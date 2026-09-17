@@ -19,6 +19,10 @@ integrar desde un lenguaje que todavía no tiene SDK.
 | POST | `/documents/:id/void` | `documents` | Anular con nota de crédito |
 | GET | `/documents/:id/xml` | `documents` | El DTE firmado |
 | GET | `/folios` | `documents` | Folios disponibles por tipo |
+| POST | `/honorarios` | `honorarios` | Emitir boleta de honorarios de terceros |
+| GET | `/honorarios?reference=` | `honorarios` | Buscar por la referencia de tu pago |
+| GET | `/honorarios/:id` | `honorarios` | Estado y montos de la boleta |
+| POST | `/honorarios/:id/anular` | `honorarios` | Anularla en el SII |
 | GET | `/products` | `read` | El catálogo |
 | POST | `/products/upsert` | `write` | Crear o actualizar por SKU |
 | POST | `/stock/commit` | `write` | Descontar stock al cobrar |
@@ -116,6 +120,82 @@ es la fuente de verdad; la web sólo aporta lo que él todavía no sabe.
 Emite la nota de crédito con `CodRef 1` —«anula el documento de referencia»—
 copiando líneas y cliente del original. Idempotente: si ya estaba anulado
 devuelve la nota existente con `repetido: true`.
+
+## POST /honorarios
+
+Boleta de honorarios de terceros (BHTE). Otro registro del SII: no es un DTE y
+no gasta folios del CAF.
+
+```jsonc
+{
+  "rut": "11.111.111-1",         // el PRESTADOR: quien hizo el trabajo
+  "name": "Ana Soto",
+  "grossAmount": 1000000,        // el BRUTO. La retención la aplica el SII
+  "reference": "PAGO-77",        // tu número de pago
+  "source": "pagos",
+  "issueDate": "2026-09-17",     // por defecto, hoy
+  "description": "Diseño de marca",
+  "branchId": 3,                 // número de sucursal, o su UUID
+
+  // Sólo para un prestador que todavía no es contacto en Egestia: normalmente
+  // se toman de su ficha. El SII los imprime en la boleta y sin ellos rechaza.
+  "direccion": "Los Aromos 442",
+  "comuna": "Providencia"
+}
+```
+
+Respuesta:
+
+```jsonc
+{
+  "data": {
+    "id": "8f2c…", "folio": "184", "status": "vigente", "kind": "emitida",
+    "issuer": { "rut": "11111111-1", "name": "Ana Soto", "contactId": "c1…" },
+    "issueDate": "2026-09-17", "period": "202609",
+    "grossAmount":    1000000,   // lo que ganó el prestador
+    "withholdingRate":   14.5,   // la tasa del SII, en PORCENTAJE
+    "withheldAmount":  145000,   // lo entera la empresa al SII
+    "netAmount":       855000,   // ← lo único que se transfiere
+    "siiCode": "ABC123", "branchId": "a4f0…",
+    "reference": "PAGO-77", "source": "pagos",
+    "repetido": false
+  }
+}
+```
+
+`201` cuando se emitió; `200` con `repetido: true` cuando esa referencia ya
+tenía boleta y no se emitió nada.
+
+**El 409 que hay que mirar** — misma referencia, otro monto:
+
+```jsonc
+{
+  "error": "La referencia «PAGO-77» ya emitió una boleta por $1000000, y ahora se pide por $500000…",
+  "data": { "id": "8f2c…", "folio": "184", "netAmount": 855000, "repetido": true }
+}
+```
+
+No es un reintento: es otro pago con la referencia equivocada. Devolver la
+boleta vieja en silencio haría transferir el líquido de otra prestación.
+
+El otro 409 es `Ya se está emitiendo la boleta de la referencia «…»`: hay una
+llamada con esa misma referencia emitiendo en este instante. **No emitas otra**
+—espera y consulta por referencia—. Es un candado de base de datos, y existe
+porque el `GET` previo no alcanza a ver lo que todavía se está emitiendo: sin
+él, dos llamadas simultáneas emiten dos boletas ante el SII.
+
+## POST /honorarios/:id/anular
+
+```jsonc
+{ "causa": "error_digitacion" }   // o "no_prestacion". El SII no acepta otras.
+```
+
+A diferencia de un DTE, una boleta de honorarios se anula de verdad: no hay
+nota de crédito de por medio. La anulación queda declarada y el prestador puede
+reclamarla, por eso la causa es obligatoria.
+
+Idempotente: si ya estaba anulada devuelve esa misma con `repetido: true`.
+Anular **no** devuelve la plata ya transferida.
 
 ## GET /folios
 

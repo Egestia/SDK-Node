@@ -21,6 +21,12 @@ Le mandas el JSON de una venta y te devuelve el documento tributario. El CAF, el
 certificado y la conversación con el SII los maneja Egestia: tu sistema no
 necesita saber nada de eso.
 
+Y cuando a quien le pagas es un prestador y no un cliente, le mandas el bruto y
+te devuelve la **boleta de honorarios** con la retención que aplicó el SII y el
+líquido a transferir. Es otro registro del SII —no un DTE— y no gasta folios,
+pero la regla es la misma y más cara: una boleta de más no es un folio quemado,
+es una retención que la empresa declara y entera.
+
 ```
 tu web  ──JSON──>  SDK  ──HTTPS──>  Egestia  ──DTE──>  SII
                     │                  │

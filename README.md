@@ -2,7 +2,9 @@
 
 Cliente de la API pública de Egestia. Le mandas el JSON de una venta y te
 devuelve el documento tributario: boleta o factura, con su folio y su estado
-frente al SII.
+frente al SII. Y si a quien le pagas es un prestador y no un cliente, le mandas
+el bruto y te devuelve la **boleta de honorarios** con la retención que aplicó
+el SII y el líquido a transferir.
 
 El **CAF lo maneja Egestia**, con los folios de ese cliente. Tu sistema no
 necesita saber nada del SII: manda la venta y recibe el resultado.
@@ -246,6 +248,115 @@ Es idempotente: si el documento ya estaba anulado, devuelve la nota que existía
 Sólo se puede anular lo que ya tiene folio. Un borrador todavía no existe para
 el SII: se descarta desde Egestia.
 
+## Boletas de honorarios
+
+Cuando a quien le pagas no es un cliente sino un prestador, el documento no es
+una venta: es una **boleta de honorarios de terceros** que la empresa emite
+*por cuenta de él*, le retiene al SII lo que corresponde y le transfiere el
+resto. Otro registro del SII, y **no gasta folios del CAF**.
+
+```ts
+const boleta = await egestia.honorarios.emitir({
+  rut: '11.111.111-1',
+  nombre: 'Ana Soto',
+  bruto: 1_000_000,             // lo que acordaste pagarle
+  referencia: pago.id,          // ← IMPORTANTE, más abajo
+  origen: 'pagos',
+  descripcion: 'Diseño de marca',
+  sucursal: 3,                  // a qué sucursal se carga el gasto
+});
+```
+
+La respuesta trae los tres montos ya resueltos por el SII:
+
+```ts
+boleta.folio            // '184'      número de la boleta
+boleta.grossAmount      // 1000000    lo que ganó el prestador; lo que él declara
+boleta.withholdingRate  // 14.5       la tasa que aplicó el SII, en porcentaje
+boleta.withheldAmount   //  145000    lo retiene la empresa y lo entera al SII
+boleta.netAmount        //  855000    ← lo ÚNICO que se transfiere
+
+await transferir(boleta.issuer.rut, boleta.netAmount);
+```
+
+**Se transfiere `netAmount`, no `grossAmount`.** La diferencia la entera la
+empresa al SII: transferirla igual es pagarla dos veces, una al prestador y otra
+al fisco.
+
+**Tú mandas el bruto y nada más.** La retención no se calcula por fuera: la
+aplica el SII con la tasa vigente para ese receptor, que cambia todos los años.
+Emitir con una tasa vieja significa retener de menos y responder por la
+diferencia.
+
+### `referencia`: acá pesa más que en una venta
+
+Un DTE duplicado es un folio quemado. Una boleta de honorarios duplicada es una
+**retención duplicada** que la empresa declara y entera al SII, y un prestador
+con dos boletas a su nombre. Deshacerlo es anular en el SII —con causa, que él
+puede reclamar— y rehacer la transferencia.
+
+Con referencia, repetir la llamada devuelve la boleta que ya existe en vez de
+emitir otra, y el SDK puede reintentar solo ante un corte de red:
+
+```ts
+const boleta = await egestia.honorarios.emitir({ referencia: pago.id, /* ... */ });
+if (boleta.repetido) {
+  // No se emitió nada: esta referencia ya tenía boleta. Si ya transferiste,
+  // no vuelvas a transferir.
+}
+```
+
+Sin referencia el SDK **no reintenta**, porque un segundo intento sería una
+segunda boleta.
+
+Si dudas de si un pago alcanzó a emitir:
+
+```ts
+const existente = await egestia.honorarios.buscarPorReferencia(pago.id, { origen: 'pagos' });
+if (!existente) await egestia.honorarios.emitir({ /* ... */ });
+```
+
+Y si la misma referencia llega con **otro monto**, eso no es un reintento: es
+otro pago con la referencia equivocada. El SDK lo frena en vez de devolverte la
+boleta vieja —que te haría transferir el líquido de otra prestación—.
+
+### Consultar y anular
+
+```ts
+const boleta = await egestia.honorarios.obtener(id);
+// → { folio, status, grossAmount, withheldAmount, netAmount, issuer, ... }
+```
+
+En el SII una boleta de honorarios **sí se anula** —no hay nota de crédito de
+por medio, como en un DTE— pero hay que decir por qué, y el SII ofrece
+exactamente dos causas:
+
+```ts
+await egestia.honorarios.anular(boleta.id, { causa: 'error_digitacion' });
+// 'no_prestacion'    el servicio no se prestó
+// 'error_digitacion' la boleta salió con un dato malo
+```
+
+Es idempotente: si ya estaba anulada devuelve esa misma (`repetido: true`).
+**Anular no devuelve la plata**: si ya transferiste el líquido, eso se arregla
+aparte.
+
+### La sucursal
+
+`sucursal` acepta el **número** que sale en el listado de sucursales, o su UUID.
+Un honorario es un gasto, y sin sucursal se carga entero a la principal: el
+informe por centro de costo queda con una inflada y las otras limpias. Es el
+mismo criterio con que los DTE guardan la suya.
+
+### El scope
+
+Emitir boletas de honorarios necesita el scope **`honorarios`**, que va aparte
+de `documents`: retener plata de un prestador y enterarla al SII no es lo mismo
+que facturar una venta, y una key de tienda no tiene por qué poder hacerlo.
+
+También está `intentarEmitir()` / `intentarAnular()`, con la misma forma que en
+documentos: devuelven el problema explicado en vez de lanzarlo.
+
 ## Cuando algo falla, el SDK te dice qué pasó
 
 Hay dos formas de trabajar. La que **no lanza** es la recomendada para procesar
@@ -369,5 +480,10 @@ await egestia.stock.liberar({ reference: pedido.id });   // si el pago no se con
 ## Scopes
 
 La key necesita el scope de cada cosa: `documents` para emitir, consultar y
-anular; `read` para el catálogo; `write` para stock y productos. Una key con
+anular boletas y facturas; `honorarios` para las boletas de honorarios de
+terceros; `read` para el catálogo; `write` para stock y productos. Una key con
 `write` puede todo.
+
+`honorarios` va aparte de `documents` a propósito: emitir por cuenta de un
+prestador retiene plata que la empresa entera al SII, y eso no debería venir de
+regalo con el permiso de facturar.

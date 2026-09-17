@@ -33,7 +33,8 @@ Integraciones. Las claves empiezan con `egst_`.
 ### `scope` — permisos de la key
 
 A la clave le falta el permiso de esa operación. Para emitir, anular y consultar
-hace falta `documents`; para el catálogo, `read`; para stock y productos,
+boletas y facturas hace falta `documents`; para las boletas de honorarios de
+terceros, `honorarios`; para el catálogo, `read`; para stock y productos,
 `write`. Una clave con `write` puede todo.
 
 ### `configuracion` — falta algo en Egestia
@@ -45,6 +46,7 @@ El cliente no terminó de configurarse. Los casos que reconoce:
 | Configure la empresa SII primero | Los datos del emisor, en SII → Configuración |
 | El ambiente SII no está habilitado | Activar «Ambiente habilitado para emitir documentos» |
 | Certificado… | El certificado digital falta o venció |
+| …no tiene clave tributaria | La clave del SII, en Configuración → SII → Certificado Digital. Sin ella no hay boletas de honorarios |
 
 **El documento queda creado en borrador.** Cuando se resuelva la configuración,
 reenviar la venta lo emite —con su folio.

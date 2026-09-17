@@ -190,3 +190,168 @@ test('valida antes de salir a la red', async () => {
   await assert.rejects(() => cliente.documentos.emitir({ ...VENTA, items: [] }), /al menos un ítem/);
   assert.equal(llamadas.length, 0, 'no debe llamar a la API con datos que ya se sabe que están mal');
 });
+
+// ── Boletas de honorarios de terceros ────────────────────────────────────────
+//
+// Lo que se prueba acá es lo que distingue una boleta de honorarios de una
+// venta: que el líquido llegue separado del bruto, que sin referencia el SDK no
+// reintente —una boleta de más es una retención de más— y que un monto distinto
+// sobre la misma referencia se explique en vez de devolver la boleta vieja.
+
+const BOLETA = {
+  id: 'h1',
+  folio: '184',
+  status: 'vigente',
+  kind: 'emitida',
+  issuer: { rut: '11.111.111-1', name: 'Ana Soto', contactId: 'c1' },
+  issueDate: '2026-09-17',
+  period: '202609',
+  description: 'Diseño de marca',
+  grossAmount: 1000000,
+  withholdingRate: 14.5,
+  withheldAmount: 145000,
+  netAmount: 855000,
+  siiCode: 'ABC123',
+  branchId: null,
+  reference: 'PAGO-77',
+  source: 'pagos',
+};
+
+const HONORARIO = {
+  rut: '11.111.111-1',
+  nombre: 'Ana Soto',
+  bruto: 1000000,
+  referencia: 'PAGO-77',
+  origen: 'pagos',
+  descripcion: 'Diseño de marca',
+};
+
+test('el líquido a transferir viene aparte del bruto', async () => {
+  const { cliente } = clienteCon(() => respuesta({ data: BOLETA }));
+  const boleta = await cliente.honorarios.emitir(HONORARIO);
+
+  assert.equal(boleta.grossAmount, 1000000);
+  assert.equal(boleta.withheldAmount, 145000);
+  // Lo que se transfiere. Si esto fuera el bruto, se pagaría la retención dos
+  // veces: una al prestador y otra al SII.
+  assert.equal(boleta.netAmount, 855000);
+  assert.equal(boleta.withheldAmount + boleta.netAmount, boleta.grossAmount);
+});
+
+test('manda el BRUTO, no una retención calculada por fuera', async () => {
+  const { cliente, llamadas } = clienteCon(() => respuesta({ data: BOLETA }));
+  await cliente.honorarios.emitir(HONORARIO);
+
+  assert.equal(llamadas[0].body.grossAmount, 1000000);
+  assert.equal(llamadas[0].body.withheldAmount, undefined);
+  assert.equal(llamadas[0].body.withholdingRate, undefined);
+});
+
+test('la sucursal viaja como la manda quien emite', async () => {
+  const { cliente, llamadas } = clienteCon(() => respuesta({ data: BOLETA }));
+  await cliente.honorarios.emitir({ ...HONORARIO, sucursal: 3 });
+
+  assert.equal(llamadas[0].body.branchId, 3);
+});
+
+test('sin referencia NO reintenta: un reintento sería otra boleta ante el SII', async () => {
+  const { cliente, llamadas } = clienteCon(() => respuesta({ error: 'caída' }, 500), { reintentos: 3 });
+
+  await assert.rejects(() => cliente.honorarios.emitir({ ...HONORARIO, referencia: undefined }));
+  assert.equal(llamadas.length, 1, 'no debe insistir sin referencia');
+});
+
+test('con referencia sí reintenta: Egestia devuelve la que ya emitió', async () => {
+  const { cliente, llamadas } = clienteCon(
+    (n) => (n === 1 ? respuesta({ error: 'caída' }, 500) : respuesta({ data: BOLETA })),
+    { reintentos: 2 },
+  );
+
+  const boleta = await cliente.honorarios.emitir(HONORARIO);
+  assert.equal(llamadas.length, 2);
+  assert.equal(boleta.folio, '184');
+});
+
+test('la misma referencia con OTRO monto se explica, no se devuelve la vieja', async () => {
+  const { cliente } = clienteCon(() => respuesta({
+    error: 'La referencia «PAGO-77» ya emitió una boleta por $1000000, y ahora se pide por $500000.',
+    data: { ...BOLETA, repetido: true },
+  }, 409));
+
+  const r = await cliente.honorarios.intentarEmitir({ ...HONORARIO, bruto: 500000 });
+
+  assert.equal(r.ok, false);
+  assert.equal(r.problema.tipo, 'ya_emitida');
+  assert.match(r.problema.queHacer, /anúlala/i);
+  // La boleta que sí existe viaja en el detalle: sin esto, quien integra no
+  // sabe cuánto se emitió de verdad ni cuánto transferir.
+  assert.equal(r.problema.detalle.data.netAmount, 855000);
+});
+
+test('«se está emitiendo ahora mismo» es reintentable, no un error de datos', async () => {
+  const { cliente } = clienteCon(() => respuesta({
+    error: 'Ya se está emitiendo la boleta de la referencia «PAGO-77».',
+  }, 409));
+
+  const r = await cliente.honorarios.intentarEmitir(HONORARIO);
+  assert.equal(r.problema.tipo, 'en_curso');
+  assert.equal(r.problema.reintentable, true);
+  assert.match(r.problema.queHacer, /buscarPorReferencia/);
+});
+
+test('la clave tributaria que falta no se confunde con un certificado vencido', async () => {
+  const { cliente } = clienteCon(() => respuesta({
+    error: 'Acme SpA no tiene clave tributaria. Se configura en Configuración → SII → Certificado Digital.',
+  }, 400));
+
+  const r = await cliente.honorarios.intentarEmitir(HONORARIO);
+  assert.equal(r.problema.tipo, 'configuracion');
+  assert.match(r.problema.queHacer, /clave tributaria/i);
+});
+
+test('buscar por referencia devuelve null cuando el pago aún no emitió boleta', async () => {
+  const { cliente, llamadas } = clienteCon(() => respuesta({ data: null }));
+  const boleta = await cliente.honorarios.buscarPorReferencia('PAGO-99', { origen: 'pagos' });
+
+  assert.equal(boleta, null);
+  assert.match(llamadas[0].url, /reference=PAGO-99/);
+  assert.match(llamadas[0].url, /source=pagos/);
+});
+
+test('anular exige la causa antes de salir a la red', async () => {
+  const { cliente, llamadas } = clienteCon(() => respuesta({ data: BOLETA }));
+
+  await assert.rejects(() => cliente.honorarios.anular('h1', {}), /no_prestacion/);
+  assert.equal(llamadas.length, 0);
+});
+
+test('anular dos veces devuelve la misma boleta anulada', async () => {
+  const { cliente } = clienteCon(() => respuesta({
+    data: { ...BOLETA, status: 'anulada', repetido: true },
+  }));
+
+  const boleta = await cliente.honorarios.anular('h1', { causa: 'error_digitacion' });
+  assert.equal(boleta.status, 'anulada');
+  assert.equal(boleta.repetido, true);
+});
+
+test('valida el monto antes de salir a la red', async () => {
+  const { cliente, llamadas } = clienteCon(() => respuesta({ data: BOLETA }));
+
+  await assert.rejects(() => cliente.honorarios.emitir({ ...HONORARIO, bruto: 0 }), /bruto/);
+  await assert.rejects(() => cliente.honorarios.emitir({ ...HONORARIO, rut: '' }), /RUT/);
+  assert.equal(llamadas.length, 0);
+});
+
+test('el registro cuenta los intentos de un pago, sin mezclarlo con una venta', async () => {
+  const almacen = new AlmacenEnMemoria();
+  const { cliente } = clienteCon(() => respuesta({ data: BOLETA }), { almacen });
+
+  await cliente.honorarios.emitir(HONORARIO);
+  await cliente.honorarios.emitir(HONORARIO);
+
+  const delPago = await cliente.interacciones.ver('honorarios:pagos:PAGO-77');
+  assert.equal(delPago.intentos, 2);
+  // Una venta con el mismo número en el mismo origen es otra cosa.
+  assert.equal(await cliente.interacciones.ver('pagos:PAGO-77'), null);
+});

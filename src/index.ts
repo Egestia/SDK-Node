@@ -4,10 +4,13 @@ import { explicar, type Resultado } from './diagnostico.js';
 import { AlmacenEnMemoria, RegistroInteracciones } from './interacciones.js';
 import type {
   Anulacion,
+  AnularHonorario,
+  BoletaHonorarios,
   Documento,
   DocumentoAnulado,
   DocumentoEmitido,
   EmitirDocumento,
+  EmitirHonorario,
   Folios,
   OpcionesCliente,
   PaginaProductos,
@@ -49,6 +52,7 @@ export class Egestia {
   private readonly http: HttpCliente;
 
   readonly documentos: Documentos;
+  readonly honorarios: Honorarios;
   readonly productos: Productos;
   readonly stock: Stock;
   /** El registro de envíos, por si quieres inspeccionarlo o volcarlo. */
@@ -82,6 +86,7 @@ export class Egestia {
 
     this.interacciones = new RegistroInteracciones(opciones.almacen ?? new AlmacenEnMemoria());
     this.documentos = new Documentos(this.http, this.interacciones);
+    this.honorarios = new Honorarios(this.http, this.interacciones);
     this.productos = new Productos(this.http);
     this.stock = new Stock(this.http);
   }
@@ -354,6 +359,175 @@ class Documentos {
       doc = await this.obtener(emitido.id);
     }
     return doc;
+  }
+}
+
+/**
+ * Boletas de honorarios de terceros (BHTE).
+ *
+ * La empresa emite la boleta POR CUENTA del prestador: le retiene al SII lo que
+ * corresponde y le transfiere el resto. Es otro registro del SII —una boleta de
+ * honorarios no es un DTE— y no gasta folios del CAF.
+ *
+ * ```ts
+ * const boleta = await egestia.honorarios.emitir({
+ *   rut: '11.111.111-1',
+ *   nombre: 'Ana Soto',
+ *   bruto: 1_000_000,            // lo que se acordó pagar
+ *   referencia: pago.id,         // ← lo que evita emitir dos veces
+ *   descripcion: 'Diseño de marca',
+ * });
+ *
+ * await transferir(boleta.issuer.rut, boleta.netAmount);   // ← el LÍQUIDO
+ * ```
+ *
+ * Lo que se transfiere es `netAmount` y no `grossAmount`: la diferencia
+ * —`withheldAmount`— la entera la empresa al SII, y transferirla igual
+ * significa pagarla dos veces.
+ */
+class Honorarios {
+  constructor(
+    private readonly http: HttpCliente,
+    private readonly interacciones: RegistroInteracciones,
+  ) {}
+
+  /**
+   * Emite una boleta de honorarios de terceros.
+   *
+   * Se manda el BRUTO y nada más: la retención la aplica el SII con la tasa
+   * vigente para ese receptor —cambia todos los años— y vuelve en la respuesta,
+   * junto con el líquido que hay que transferir.
+   *
+   * **Manda siempre `referencia`.** Acá pesa más que en una venta: un DTE de
+   * más es un folio quemado, pero una boleta de más es una retención que la
+   * empresa declara y entera al SII, y un prestador con dos boletas a su
+   * nombre. Deshacerlo es anular en el SII, con causa, y rehacer el pago.
+   *
+   * Con referencia, repetir la llamada devuelve la boleta que ya existe
+   * (`repetido: true`) en vez de emitir otra, y el SDK puede reintentar solo
+   * ante un corte de red. Sin ella no reintenta, porque un segundo intento
+   * significaría una segunda boleta.
+   */
+  async emitir(datos: EmitirHonorario): Promise<BoletaHonorarios> {
+    if (!datos?.rut) throw new Error('Se requiere el RUT del prestador');
+    if (!(datos.bruto > 0)) {
+      throw new Error(
+        'Se requiere `bruto`: el monto acordado con el prestador. El líquido a transferir lo ' +
+        'devuelve esta misma llamada, ya con la retención del SII descontada.',
+      );
+    }
+
+    // El registro sirve para saber cuántas veces se ha reintentado este pago.
+    // La clave lleva su prefijo: un pago y una venta pueden compartir número en
+    // el sistema de origen sin ser lo mismo.
+    const origen = datos.origen ?? 'sdk';
+    const clave = datos.referencia ? `honorarios:${origen}:${datos.referencia}` : null;
+    if (clave) await this.interacciones.abrir(clave);
+
+    try {
+      const boleta = await this.http.pedir<BoletaHonorarios>({
+        method: 'POST',
+        path: '/honorarios',
+        // Con referencia, repetir es seguro: Egestia devuelve la boleta que ya
+        // emitió. Sin ella, un reintento emitiría una segunda ante el SII.
+        repetible: Boolean(datos.referencia),
+        body: {
+          rut: datos.rut,
+          name: datos.nombre,
+          grossAmount: datos.bruto,
+          issueDate: datos.fecha,
+          description: datos.descripcion,
+          reference: datos.referencia ?? null,
+          source: origen,
+          branchId: datos.sucursal ?? null,
+          direccion: datos.direccion,
+          comuna: datos.comuna,
+          codigoRegion: datos.codigoRegion,
+        },
+      });
+
+      if (clave) {
+        await this.interacciones.cerrar(clave, {
+          documentId: boleta.id, folio: boleta.folio, estado: boleta.status, ultimoProblema: null,
+        });
+      }
+      return boleta;
+    } catch (error) {
+      if (clave) {
+        const p = explicar(error);
+        await this.interacciones.cerrar(clave, { ultimoProblema: p.mensaje });
+      }
+      throw error;
+    }
+  }
+
+  /** `emitir` sin lanzar: devuelve el problema explicado. */
+  async intentarEmitir(datos: EmitirHonorario): Promise<Resultado<BoletaHonorarios>> {
+    try {
+      return { ok: true, datos: await this.emitir(datos) };
+    } catch (error) {
+      return { ok: false, problema: explicar(error) };
+    }
+  }
+
+  /** La boleta: folio, montos, estado en el SII. */
+  obtener(id: string): Promise<BoletaHonorarios> {
+    return this.http.pedir<BoletaHonorarios>({
+      method: 'GET', path: `/honorarios/${id}`, repetible: true,
+    });
+  }
+
+  /**
+   * Busca la boleta de un pago por su referencia.
+   *
+   * Es la manera segura de recuperarse de un corte: antes de reintentar, se
+   * pregunta si ese pago ya emitió boleta. Devuelve `null` si todavía no.
+   */
+  buscarPorReferencia(referencia: string, opts: { origen?: string } = {}): Promise<BoletaHonorarios | null> {
+    return this.http.pedir<BoletaHonorarios | null>({
+      method: 'GET',
+      path: '/honorarios',
+      repetible: true,
+      query: { reference: referencia, source: opts.origen },
+    });
+  }
+
+  /**
+   * Anula en el SII una boleta que emitió la empresa.
+   *
+   * La causa la exige el SII y ofrece exactamente dos: `no_prestacion` —el
+   * servicio no se prestó— o `error_digitacion` —se emitió con un dato malo—.
+   * La anulación queda declarada y el prestador puede reclamarla.
+   *
+   * Es idempotente: si ya estaba anulada devuelve esa misma (`repetido: true`).
+   *
+   * Anular NO devuelve la plata: si ya se transfirió el líquido, eso se
+   * resuelve aparte.
+   */
+  // `async` a propósito, aunque valide antes de salir a la red: así el error de
+  // la causa que falta llega por el mismo camino que los demás —un `.catch()` o
+  // un `intentarAnular()`— y no como una excepción suelta que se escapa de la
+  // cola que lo llamó.
+  async anular(id: string, opts: AnularHonorario): Promise<BoletaHonorarios> {
+    if (!opts?.causa) {
+      throw new Error('El SII exige una causa: «no_prestacion» o «error_digitacion»');
+    }
+    return this.http.pedir<BoletaHonorarios>({
+      method: 'POST',
+      path: `/honorarios/${id}/anular`,
+      // Idempotente del lado del servidor: reintentar no anula «más».
+      repetible: true,
+      body: { causa: opts.causa },
+    });
+  }
+
+  /** `anular` sin lanzar: devuelve el problema explicado. */
+  async intentarAnular(id: string, opts: AnularHonorario): Promise<Resultado<BoletaHonorarios>> {
+    try {
+      return { ok: true, datos: await this.anular(id, opts) };
+    } catch (error) {
+      return { ok: false, problema: explicar(error) };
+    }
   }
 }
 

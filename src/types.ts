@@ -237,3 +237,132 @@ export interface OpcionesCliente {
   /** Implementación de fetch, por si el entorno no la trae. */
   fetch?: typeof globalThis.fetch;
 }
+
+// ── Boletas de honorarios de terceros (BHTE) ─────────────────────────────────
+
+/**
+ * Las dos causas de anulación que acepta el SII. No hay más, y no hay «otra».
+ *
+ * `no_prestacion`: el servicio no se prestó.
+ * `error_digitacion`: se emitió con un dato equivocado.
+ */
+export type CausaAnulacion = 'no_prestacion' | 'error_digitacion';
+
+/** Estado de la boleta en el SII. Una anulada no se borra: queda marcada. */
+export type EstadoBoleta = 'vigente' | 'anulada';
+
+/**
+ * Una boleta de honorarios que la empresa emite POR CUENTA del prestador.
+ *
+ * Se manda el BRUTO —lo que se acordó pagar por el trabajo— y nada más. La
+ * retención no se calcula ni se manda: la aplica el SII con la tasa vigente
+ * para ese receptor, que cambia todos los años, y vuelve en la respuesta.
+ */
+export interface EmitirHonorario {
+  /** RUT del prestador: quien hizo el trabajo y cobra el líquido. */
+  rut: string;
+  /** Su nombre. Si ya es contacto en Egestia se completa solo. */
+  nombre?: string;
+  /**
+   * El monto BRUTO, en pesos.
+   *
+   * Es lo que gana el prestador y lo que él declara como ingreso. Lo que se le
+   * transfiere es menos: sale en `netAmount` de la respuesta.
+   */
+  bruto: number;
+  /**
+   * Identificador de ESTE pago en tu sistema. Mándalo siempre.
+   *
+   * Es lo que hace la operación idempotente. Sin referencia, un reintento
+   * —una cola que reenvía, un timeout, un doble clic— emite una SEGUNDA boleta
+   * ante el SII: otra retención que la empresa declara y entera, y un prestador
+   * al que hay que explicarle por qué tiene dos.
+   */
+  referencia?: string;
+  /** De qué sistema viene el pago. Dos sistemas pueden numerar igual. */
+  origen?: string;
+  /** Fecha de emisión, `AAAA-MM-DD`. Por defecto, hoy. */
+  fecha?: string;
+  /** Qué se prestó. Sale impreso en la boleta. */
+  descripcion?: string;
+  /**
+   * Sucursal a la que se carga el gasto: su NÚMERO, el que sale en el listado
+   * de sucursales, o su UUID. Sin ella la boleta queda sin centro de costo.
+   */
+  sucursal?: string | number;
+  /**
+   * Domicilio y comuna del prestador, que el SII imprime en la boleta.
+   *
+   * Normalmente no se mandan: se toman de su ficha de contacto en Egestia. Van
+   * acá para el primer pago a alguien que todavía no es contacto.
+   */
+  direccion?: string;
+  comuna?: string;
+  codigoRegion?: number;
+}
+
+/**
+ * Una boleta de honorarios, con los tres montos que el SII ya resolvió.
+ *
+ * Los tres van separados porque son tres cosas distintas, y deducir uno de otro
+ * con una tasa que cambia cada año es exactamente el error que esto evita:
+ *
+ * ```
+ * grossAmount     1.000.000   lo que ganó el prestador; lo que él declara
+ * withheldAmount    145.000   lo retiene la empresa y lo entera al SII
+ * netAmount         855.000   ← lo ÚNICO que se transfiere
+ * ```
+ */
+export interface BoletaHonorarios {
+  id: string;
+  /** Número de la boleta en el SII. */
+  folio: string | null;
+  status: EstadoBoleta;
+  /** `emitida` por la empresa, o `recibida` del prestador. */
+  kind: 'emitida' | 'recibida';
+
+  /** El prestador: a quien se le paga. */
+  issuer: {
+    rut: string;
+    name: string | null;
+    /** Su id de contacto en Egestia. */
+    contactId: string | null;
+  };
+
+  issueDate: string | null;
+  /** Período tributario `AAAAMM` al que corresponde. */
+  period: string | null;
+  description: string | null;
+
+  /** Lo que ganó el prestador. Es lo que se manda al emitir. */
+  grossAmount: number;
+  /**
+   * La tasa que aplicó el SII, en PORCENTAJE: `14.5` es 14,5 %.
+   *
+   * Viaja para mostrarla y cuadrarla, no para recalcular con ella. El número
+   * bueno es `netAmount`, que ya viene aplicado.
+   */
+  withholdingRate: number | null;
+  /** Lo que la empresa retiene y entera al SII. NO se transfiere. */
+  withheldAmount: number;
+  /** Lo único que se transfiere al prestador. */
+  netAmount: number;
+
+  /** Código con que el SII la identifica, para pedir su PDF. */
+  siiCode: string | null;
+  /** Sucursal a la que quedó cargado el gasto. */
+  branchId: string | null;
+  reference: string | null;
+  source: string | null;
+
+  /**
+   * `true` cuando la llamada NO emitió nada: esa referencia ya tenía boleta y
+   * se devolvió la que existía.
+   */
+  repetido?: boolean;
+}
+
+export interface AnularHonorario {
+  /** La causa que exige el SII. Son dos, y hay que elegir una. */
+  causa: CausaAnulacion;
+}
