@@ -10,7 +10,9 @@ import type {
   DocumentoAnulado,
   DocumentoEmitido,
   EmitirDocumento,
+  EmitirFacturaCompra,
   EmitirHonorario,
+  FacturaCompra,
   Folios,
   OpcionesCliente,
   PaginaProductos,
@@ -53,6 +55,7 @@ export class Egestia {
 
   readonly documentos: Documentos;
   readonly honorarios: Honorarios;
+  readonly facturasCompra: FacturasCompra;
   readonly productos: Productos;
   readonly stock: Stock;
   /** El registro de envíos, por si quieres inspeccionarlo o volcarlo. */
@@ -87,6 +90,7 @@ export class Egestia {
     this.interacciones = new RegistroInteracciones(opciones.almacen ?? new AlmacenEnMemoria());
     this.documentos = new Documentos(this.http, this.interacciones);
     this.honorarios = new Honorarios(this.http, this.interacciones);
+    this.facturasCompra = new FacturasCompra(this.http, this.interacciones);
     this.productos = new Productos(this.http);
     this.stock = new Stock(this.http);
   }
@@ -528,6 +532,194 @@ class Honorarios {
     } catch (error) {
       return { ok: false, problema: explicar(error) };
     }
+  }
+}
+
+/**
+ * Facturas de compra por servicios del exterior (DTE 46).
+ *
+ * Cuando le pagas a un prestador de otro país —un creador, un freelancer, un
+ * servicio— y tu empresa es contribuyente de IVA en Chile, la ley te convierte
+ * en el sujeto del impuesto (DL 825 art. 11 letra e): el SII te exige emitir TÚ
+ * la factura, recargar el IVA y retenerlo entero (Res. Ex. 42/2018).
+ *
+ * ```ts
+ * const factura = await egestia.facturasCompra.emitir({
+ *   nombre: creador.nombre,
+ *   pais: creador.pais,
+ *   monto: 1000,                  // el NETO, en la moneda del pago
+ *   moneda: 'USD',
+ *   referencia: pago.id,          // ← lo que evita emitir dos veces
+ *   descripcion: 'Contenido de septiembre',
+ * });
+ *
+ * await transferir(creador, factura.amount);   // lo pactado, en su moneda
+ * ```
+ *
+ * Mandas el NETO y nada más: el IVA lo calcula Egestia con el tipo de cambio
+ * del día, lo recarga y lo retiene entero, así que el total del documento vuelve
+ * a ser el neto. En pesos eso es `net`; en la moneda del pago, `amount`. El IVA
+ * retenido (`withheld`) lo declaras en el código 39 del F29, y el mismo IVA es
+ * tu crédito fiscal.
+ *
+ * No hay `anular`: un DTE 46 emitido se echa atrás con una nota de crédito, y
+ * eso hoy se hace desde Egestia.
+ */
+class FacturasCompra {
+  constructor(
+    private readonly http: HttpCliente,
+    private readonly interacciones: RegistroInteracciones,
+  ) {}
+
+  /**
+   * Emite la factura de compra por un pago al exterior.
+   *
+   * **Manda siempre `referencia`.** Acá pesa más que en una venta: un DTE 46
+   * duplicado son tres cosas mal —el folio quemado, una cuenta por pagar de más
+   * al prestador, y un crédito fiscal duplicado en el F29—, y el camino de
+   * vuelta es una nota de crédito que el SII y el prestador ven.
+   *
+   * Con referencia, repetir la llamada devuelve la factura que ya existe
+   * (`repetido: true`) en vez de emitir otra. Y si un intento anterior quedó a
+   * medias —sin CAF, sin tipo de cambio— el reintento retoma ESE borrador y lo
+   * emite con su mismo folio, en vez de dejar uno nuevo cada vez.
+   */
+  async emitir(datos: EmitirFacturaCompra): Promise<FacturaCompra> {
+    if (!datos?.nombre) throw new Error('Se requiere el nombre del prestador');
+    const tieneDetalle = Array.isArray(datos.items) && datos.items.length > 0;
+    if (!tieneDetalle && !(datos.monto! > 0)) {
+      throw new Error(
+        'Se requiere `monto` —lo acordado con el prestador, en su moneda— o `items` con el detalle. ' +
+        'Va el NETO: el IVA lo recarga y lo retiene Egestia.',
+      );
+    }
+
+    const origen = datos.origen ?? 'sdk';
+    const clave = datos.referencia ? `facturas-compra:${origen}:${datos.referencia}` : null;
+    if (clave) await this.interacciones.abrir(clave);
+
+    try {
+      const factura = await this.http.pedir<FacturaCompra>({
+        method: 'POST',
+        path: '/facturas-compra',
+        // Con referencia, repetir es seguro: Egestia devuelve la que ya emitió,
+        // o retoma el borrador que quedó. Sin ella, otro DTE 46.
+        repetible: Boolean(datos.referencia),
+        body: {
+          rut: datos.rut,
+          name: datos.nombre,
+          country: datos.pais,
+          address: datos.direccion,
+          giro: datos.giro,
+          amount: datos.monto,
+          items: datos.items?.map((l) => ({
+            description: l.descripcion,
+            quantity: l.cantidad,
+            unitPrice: l.precioUnitario,
+            amount: l.monto,
+          })),
+          description: datos.descripcion,
+          currency: datos.moneda ?? 'USD',
+          exchangeRate: datos.tipoCambio ?? null,
+          issueDate: datos.fecha,
+          invoiceNumber: datos.numeroInvoice,
+          reference: datos.referencia ?? null,
+          source: origen,
+          expenseAccountId: datos.cuentaGastoId ?? null,
+          notes: datos.notas ?? null,
+          emit: datos.emitir ?? true,
+        },
+      });
+
+      if (clave) {
+        await this.interacciones.cerrar(clave, {
+          documentId: factura.id, folio: factura.folio, estado: factura.status, ultimoProblema: null,
+        });
+      }
+      return factura;
+    } catch (error) {
+      // El fallo se anota: la factura pudo quedar en borrador, y el próximo
+      // intento tiene que encontrarla por su referencia.
+      if (clave) {
+        const p = explicar(error);
+        await this.interacciones.cerrar(clave, {
+          documentId: p.documentId ?? null, ultimoProblema: p.mensaje,
+        });
+      }
+      throw error;
+    }
+  }
+
+  /** `emitir` sin lanzar: devuelve el problema explicado. */
+  async intentarEmitir(datos: EmitirFacturaCompra): Promise<Resultado<FacturaCompra>> {
+    try {
+      return { ok: true, datos: await this.emitir(datos) };
+    } catch (error) {
+      return { ok: false, problema: explicar(error) };
+    }
+  }
+
+  /** La factura: folio, montos, estado en el SII. */
+  obtener(id: string): Promise<FacturaCompra> {
+    return this.http.pedir<FacturaCompra>({
+      method: 'GET', path: `/facturas-compra/${id}`, repetible: true,
+    });
+  }
+
+  /**
+   * Busca la factura de un pago por su referencia.
+   *
+   * La manera segura de recuperarse de un corte: antes de reintentar, se
+   * pregunta si ese pago ya emitió factura. Devuelve `null` si todavía no.
+   */
+  buscarPorReferencia(referencia: string, opts: { origen?: string } = {}): Promise<FacturaCompra | null> {
+    return this.http.pedir<FacturaCompra | null>({
+      method: 'GET',
+      path: '/facturas-compra',
+      repetible: true,
+      query: { reference: referencia, source: opts.origen },
+    });
+  }
+
+  /**
+   * Le pregunta al SII en qué quedó la factura y actualiza su estado.
+   *
+   * El SII acepta el envío y resuelve después: una factura recién emitida queda
+   * `enviada` hasta que contesta. En la app de Egestia esto es un botón.
+   */
+  verificar(id: string): Promise<FacturaCompra> {
+    return this.http.pedir<FacturaCompra>({
+      method: 'POST', path: `/facturas-compra/${id}/verificar`, repetible: true,
+    });
+  }
+
+  /**
+   * Emite y espera a que el SII se pronuncie.
+   *
+   * Emite y va preguntando hasta que la factura deje de estar `enviada`.
+   */
+  async emitirYEsperar(
+    datos: EmitirFacturaCompra,
+    opts: { intentos?: number; esperaMs?: number } = {},
+  ): Promise<FacturaCompra> {
+    const emitida = await this.emitir(datos);
+    if (emitida.status !== 'enviada') return emitida;
+
+    const intentos = opts.intentos ?? 8;
+    const espera = opts.esperaMs ?? 3000;
+
+    let factura = emitida;
+    for (let i = 0; i < intentos && factura.status === 'enviada'; i += 1) {
+      await new Promise((r) => setTimeout(r, espera));
+      try {
+        factura = await this.verificar(factura.id);
+      } catch {
+        // Que la consulta falle no invalida la emisión: el documento está en el
+        // SII y su estado se puede mirar después.
+        return factura;
+      }
+    }
+    return factura;
   }
 }
 

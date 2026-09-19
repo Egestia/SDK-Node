@@ -15,8 +15,9 @@ export type TipoProblema =
   | 'configuracion' // falta algo en Egestia: SII o certificado
   | 'sin_folios'    // se acabó el CAF de ese tipo de documento
   | 'ya_aceptado'   // el SII ya lo recibió: no admite correcciones
-  | 'ya_emitida'    // esa referencia ya emitió boleta de honorarios, por otro monto
+  | 'ya_emitida'    // esa referencia ya emitió documento, por otro monto
   | 'en_curso'      // la misma referencia se está emitiendo ahora mismo
+  | 'sin_tipo_cambio' // no hay valor de la moneda para esa fecha
   | 'sii'           // el SII rechazó o no contestó
   | 'red'           // no llegó
   | 'no_encontrado' // el id o la referencia no existen en ese cliente
@@ -111,7 +112,7 @@ const CAUSAS: Array<{
 
   // ── Boletas de honorarios ──────────────────────────────────────────────────
   {
-    busca: /ya emitió una boleta por/i,
+    busca: /ya emitió una boleta por|ya emitió una factura por/i,
     tipo: 'ya_emitida',
     queHacer:
       'Esa referencia ya emitió una boleta, y por OTRO monto: no es un reintento, es otro pago con la ' +
@@ -120,7 +121,7 @@ const CAUSAS: Array<{
       'con una referencia nueva.',
   },
   {
-    busca: /Ya se está emitiendo la boleta/i,
+    busca: /Ya se está emitiendo (la boleta|la factura)/i,
     tipo: 'en_curso',
     queHacer:
       'Otra llamada con esta misma referencia está emitiendo ahora mismo. No emitas otra: espera unos ' +
@@ -145,6 +146,39 @@ const CAUSAS: Array<{
     busca: /Sólo se anulan las boletas que emitió la empresa/i,
     tipo: 'validacion',
     queHacer: 'Una boleta recibida la anula quien la emitió: desde acá no se puede.',
+  },
+  // ── Facturas de compra por servicios del exterior ──────────────────────────
+  {
+    busca: /No tenemos el valor de|No hay tipo de cambio para la moneda/i,
+    tipo: 'sin_tipo_cambio',
+    queHacer:
+      'Egestia no tiene el valor de esa moneda para la fecha de emisión, y el SII exige emitir con el ' +
+      'del día (Oficio 1794/2017). No se inventa: la factura queda en borrador con su referencia, así ' +
+      'que reintentar la MISMA referencia más tarde la emite. Si es urgente, manda `tipoCambio`.',
+    reintentable: true,
+  },
+  {
+    busca: /No hay CAF de factura de compra/i,
+    tipo: 'sin_folios',
+    queHacer:
+      'Falta el CAF del tipo 46 —factura de compra—, que es distinto del de las facturas de venta. ' +
+      'Hay que pedirlo al SII y cargarlo en Egestia (SII → Folios/CAF). La factura queda en borrador ' +
+      'con su referencia y se emite al reintentar, sin duplicarse.',
+  },
+  {
+    busca: /forma de RUT chileno|nómina de prestadores extranjeros/i,
+    tipo: 'validacion',
+    queHacer:
+      'El receptor de una factura de compra es el número del prestador en la nómina de inscritos del ' +
+      'SII, o 55.555.555-5 si no está inscrito. Egestia resuelve el que corresponde: mira `avisos` en ' +
+      'la respuesta para saber cuál usó.',
+  },
+  {
+    busca: /se corrige con una nota de crédito/i,
+    tipo: 'ya_aceptado',
+    queHacer:
+      'La factura ya está en el SII y no se edita. Para echarla atrás hay que emitir una nota de ' +
+      'crédito, y eso hoy se hace desde Egestia.',
   },
   {
     busca: /No hay conexión con apibase|no se puede consultar al SII/i,
@@ -211,8 +245,8 @@ export function explicar(error: unknown): Problema {
       mensaje: error.message,
       queHacer:
         'A la API key le falta el scope de esa operación: «documents» para boletas y facturas, ' +
-        '«honorarios» para las boletas de honorarios de terceros. Se marcan al crear la key en ' +
-        'Egestia → Integraciones.',
+        '«honorarios» para las boletas de honorarios de terceros, «compras» para las facturas de ' +
+        'compra por servicios del exterior. Se marcan al crear la key en Egestia → Integraciones.',
       reintentable: false,
       status: 403,
       detalle: error.details,

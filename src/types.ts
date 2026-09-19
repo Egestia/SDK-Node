@@ -366,3 +366,168 @@ export interface AnularHonorario {
   /** La causa que exige el SII. Son dos, y hay que elegir una. */
   causa: CausaAnulacion;
 }
+
+// ── Facturas de compra por servicios del exterior (DTE 46) ───────────────────
+
+/** Estado de la factura de compra en el SII. */
+export type EstadoFacturaCompra = 'borrador' | 'enviada' | 'aceptada' | 'rechazada';
+
+/** Una línea del servicio prestado, en la moneda en que se acordó. */
+export interface LineaFacturaCompra {
+  descripcion?: string;
+  cantidad?: number;
+  /** Precio unitario en la moneda del pago. */
+  precioUnitario?: number;
+  /** Monto de la línea. Sin él, se calcula como cantidad × precio. */
+  monto?: number;
+}
+
+/**
+ * Una factura de compra por un servicio prestado desde otro país.
+ *
+ * Cuando le pagas a un prestador del exterior —un creador, un freelancer, un
+ * servicio— y tu empresa es contribuyente de IVA en Chile, la ley te convierte
+ * en el sujeto del impuesto (DL 825 art. 11 letra e): el SII te exige emitir TÚ
+ * la factura, recargar el IVA y retenerlo entero (Res. Ex. 42/2018).
+ *
+ * Se manda el NETO, o sea lo que acordaste pagarle. El IVA lo calcula y lo
+ * retiene Egestia, y el total del documento vuelve a ser ese neto: es lo que se
+ * le transfiere. El IVA retenido lo declaras en el código 39 del F29, y el
+ * mismo IVA es tu crédito fiscal.
+ */
+export interface EmitirFacturaCompra {
+  /** Nombre del prestador, tal como saldrá en la factura. */
+  nombre: string;
+  /**
+   * Su número en la nómina de prestadores extranjeros inscritos del SII.
+   *
+   * Casi nunca lo vas a tener: un creador de otro país no tiene RUT chileno. Si
+   * lo que mandas no tiene forma de RUT, Egestia resuelve el que corresponde
+   * —el de la nómina si el nombre coincide con un inscrito conocido, o el
+   * 55.555.555-5 que el SII indica para los no inscritos— y te lo dice en
+   * `avisos`.
+   */
+  rut?: string;
+  /** El país del prestador. Informativo, pero conviene guardarlo. */
+  pais?: string;
+  direccion?: string;
+  giro?: string;
+
+  /**
+   * Lo acordado con el prestador, en su moneda. El NETO.
+   *
+   * Alternativa a `items`, y lo normal: un pago sin desglose. Egestia lo
+   * convierte a pesos con el tipo de cambio del día de emisión.
+   */
+  monto?: number;
+  /** El detalle, si el pago lo tiene. Manda sobre `monto`. */
+  items?: LineaFacturaCompra[];
+  /** Qué se prestó. Sale impreso en la factura. */
+  descripcion?: string;
+
+  /** `USD` por defecto. También `EUR` y `CLP`. */
+  moneda?: 'USD' | 'EUR' | 'CLP';
+  /**
+   * Pesos por unidad de la moneda.
+   *
+   * Normalmente NO se manda: lo resuelve Egestia con el valor vigente a la
+   * fecha de emisión, que es lo que exige el SII (Oficio 1794/2017). Mándalo
+   * sólo para emitir una factura con fecha pasada y su tipo de cambio.
+   */
+  tipoCambio?: number;
+
+  /** Fecha de emisión, `AAAA-MM-DD`. Por defecto, hoy en Chile. */
+  fecha?: string;
+  /** El número del invoice del prestador, si lo hay. Queda de respaldo. */
+  numeroInvoice?: string;
+
+  /**
+   * Identificador de ESTE pago en tu sistema. Mándalo siempre.
+   *
+   * Es lo que hace la operación idempotente, y acá pesa más que en una venta:
+   * un DTE 46 duplicado son tres cosas mal —el folio quemado, una cuenta por
+   * pagar de más al prestador, y un crédito fiscal duplicado en el F29—. El
+   * camino de vuelta es una nota de crédito que el SII y el prestador ven.
+   */
+  referencia?: string;
+  /** De qué sistema viene el pago. Dos sistemas pueden numerar igual. */
+  origen?: string;
+
+  /** A qué cuenta de gasto va. Sin ella, la de gastos por omisión. */
+  cuentaGastoId?: string;
+  notas?: string;
+  /** `false` deja la factura en borrador, sin tocar el SII. */
+  emitir?: boolean;
+}
+
+/**
+ * Una factura de compra, con los montos que resuelve el SII.
+ *
+ * ```
+ * amount / currency   1000 USD   lo que acordaste pagarle
+ * exchangeRate       980.5       con qué se convirtió, el día de emisión
+ * net                980.500     el neto en pesos ← lo que se le transfiere
+ * tax                186.295     el IVA que se recarga: tu crédito fiscal
+ * withheld           186.295     el IVA retenido: código 39 del F29
+ * total              980.500     el total del documento, que es el neto
+ * ```
+ */
+export interface FacturaCompra {
+  id: string;
+  folio: string | null;
+  status: EstadoFacturaCompra;
+  /** Siempre 46: factura de compra electrónica. */
+  dteCode: 46;
+
+  /** El prestador: a quien se le paga. */
+  supplier: {
+    /** El que resolvió Egestia, que puede no ser el que mandaste. */
+    rut: string | null;
+    name: string | null;
+    country: string | null;
+    contactId: string | null;
+  };
+
+  issueDate: string | null;
+  /** Período tributario `AAAAMM`. */
+  period: string | null;
+
+  /** La moneda en que se acordó el pago. */
+  currency: string;
+  /** Lo acordado, en esa moneda. */
+  amount: number;
+  /** Pesos por unidad de la moneda, el día de emisión. */
+  exchangeRate: number | null;
+
+  /** El neto en pesos. Es lo que se le transfiere al prestador. */
+  net: number;
+  /** El IVA recargado: crédito fiscal. */
+  tax: number;
+  /** El IVA retenido, que se declara en el código 39 del F29. Igual al `tax`. */
+  withheld: number;
+  /** El total del documento, que es el neto: neto + IVA − IVA retenido. */
+  total: number;
+
+  items: Array<{
+    description: string;
+    quantity: number;
+    unitPrice: number;
+    amount: number;
+    amountClp: number;
+  }>;
+
+  invoiceNumber: string | null;
+  /** Identificador de envío del SII, para seguir el trámite. */
+  trackId: string | null;
+  reference: string | null;
+  source: string | null;
+
+  /**
+   * Lo que conviene mirar: el RUT que se resolvió por nombre, un tipo de cambio
+   * que no se pudo obtener. Que venga vacío es lo normal.
+   */
+  avisos: string[];
+
+  /** `true` cuando la llamada NO emitió nada: esa referencia ya tenía factura. */
+  repetido?: boolean;
+}

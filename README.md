@@ -4,7 +4,8 @@ Cliente de la API pública de Egestia. Le mandas el JSON de una venta y te
 devuelve el documento tributario: boleta o factura, con su folio y su estado
 frente al SII. Y si a quien le pagas es un prestador y no un cliente, le mandas
 el bruto y te devuelve la **boleta de honorarios** con la retención que aplicó
-el SII y el líquido a transferir.
+el SII y el líquido a transferir —o la **factura de compra** del DTE 46, si el
+prestador está en otro país—.
 
 El **CAF lo maneja Egestia**, con los folios de ese cliente. Tu sistema no
 necesita saber nada del SII: manda la venta y recibe el resultado.
@@ -357,6 +358,137 @@ que facturar una venta, y una key de tienda no tiene por qué poder hacerlo.
 También está `intentarEmitir()` / `intentarAnular()`, con la misma forma que en
 documentos: devuelven el problema explicado en vez de lanzarlo.
 
+## Facturas de compra por servicios del exterior
+
+Cuando le pagas a un prestador de otro país —un creador, un freelancer, un
+servicio— y tu empresa es contribuyente de IVA en Chile, la ley te convierte en
+el **sujeto del impuesto** (DL 825 art. 11 letra e). El SII no espera una
+factura de él: te exige emitirla **tú**, recargar el IVA y retenerlo entero
+(Res. Ex. 42/2018). Es el DTE 46, la factura de compra electrónica.
+
+```ts
+const factura = await egestia.facturasCompra.emitir({
+  nombre: creador.nombre,
+  pais: creador.pais,
+  monto: 1000,                  // el NETO, en la moneda del pago
+  moneda: 'USD',
+  referencia: pago.id,          // ← IMPORTANTE, más abajo
+  origen: 'mi-plataforma',
+  descripcion: 'Contenido de septiembre',
+});
+```
+
+Mandas el neto y nada más. Egestia lo convierte con el tipo de cambio del día
+—que es lo que exige el SII—, recarga el IVA y lo retiene:
+
+```ts
+factura.folio          // '87'
+factura.amount         //    1000    lo pactado, en su moneda
+factura.currency       //   'USD'
+factura.exchangeRate   //   980.5    con qué se convirtió, el día de emisión
+
+factura.net            //  980.500   el neto en pesos
+factura.tax            //  186.295   el IVA recargado: tu crédito fiscal
+factura.withheld       //  186.295   el IVA retenido: código 39 del F29
+factura.total          //  980.500   el total del documento, que ES el neto
+
+await transferir(creador, factura.amount);   // lo pactado, en su moneda
+```
+
+**El total del documento es el neto**, porque el IVA se recarga y se retiene
+entero: `neto + IVA − IVA retenido = neto`. Al prestador se le transfiere lo que
+se acordó con él (`amount` en su moneda, o `net` en pesos); el IVA retenido lo
+declaras y lo pagas en el código 39 del F29, y el mismo monto es tu crédito
+fiscal. Con débito suficiente en el mes el efecto en caja es cero, pero son dos
+partidas, no una compra sin IVA.
+
+### El RUT del prestador
+
+Un creador de otro país no tiene RUT chileno, y no hace falta que lo tenga. El
+receptor del DTE es su número en la **nómina de prestadores extranjeros
+inscritos** del SII, o el `55.555.555-5` que el SII indica para los no
+inscritos.
+
+Manda `rut` si lo tienes. Si no, o si lo que mandas no tiene forma de RUT
+chileno, Egestia resuelve el que corresponde —busca el nombre entre los
+inscritos conocidos— y te dice cuál usó:
+
+```ts
+factura.supplier.rut   // '55555555-5'
+factura.avisos         // ['Jane Doe no figura entre los inscritos conocidos: se usa 55555555-5.']
+```
+
+Vale la pena mirar `avisos`: viene vacío cuando no hubo nada que resolver.
+
+### `referencia`: tres cosas mal en vez de una
+
+Un DTE de venta duplicado es un folio quemado. Un **DTE 46 duplicado son tres
+cosas**: el folio quemado, una cuenta por pagar de más a un prestador que prestó
+el servicio una sola vez, y un **crédito fiscal duplicado en el F29** —o sea un
+impuesto declarado de menos—. El camino de vuelta es una nota de crédito que el
+SII y el prestador ven.
+
+Con referencia, repetir la llamada devuelve la factura que ya existe:
+
+```ts
+if (factura.repetido) {
+  // No se emitió nada: esta referencia ya tenía factura.
+  // Si ya transferiste, no vuelvas a transferir.
+}
+```
+
+Y hay un tercer caso que el SDK resuelve solo: si un intento anterior **quedó en
+borrador** —faltaba el CAF del 46, no había tipo de cambio ese día— el reintento
+retoma *ese* borrador y lo emite con su mismo folio, en vez de dejar un borrador
+nuevo por cada intento.
+
+Si la misma referencia llega con otro monto, eso no es un reintento: es otro pago
+con la referencia equivocada, y el SDK lo frena antes de que transfieras el
+líquido de otro servicio.
+
+### Consultar
+
+```ts
+const factura = await egestia.facturasCompra.obtener(id);
+const existente = await egestia.facturasCompra.buscarPorReferencia(pago.id, { origen: 'mi-plataforma' });
+```
+
+El SII acepta el envío y resuelve después, así que una factura recién emitida
+queda `enviada`. Para saber en qué quedó:
+
+```ts
+const final = await egestia.facturasCompra.verificar(factura.id);
+// status: 'borrador' | 'enviada' | 'aceptada' | 'rechazada'
+```
+
+O de una vez, emitiendo:
+
+```ts
+const final = await egestia.facturasCompra.emitirYEsperar(pago, { intentos: 8, esperaMs: 3000 });
+```
+
+### Lo que hay que tener listo en Egestia
+
+Dos cosas, y las dos fallan con un mensaje que las nombra:
+
+- **Un CAF del tipo 46.** Es distinto del de las facturas de venta: tener folios
+  de factura no da folios de factura de compra.
+- **El tipo de cambio del día.** Egestia lo saca de sus indicadores y no lo
+  inventa: si no lo tiene, la factura queda en borrador con su referencia y el
+  reintento la emite. Un dólar supuesto es un DTE mal emitido, y eso sólo se
+  arregla con nota de crédito.
+
+### No hay `anular`
+
+Un DTE 46 emitido se echa atrás con una nota de crédito, y eso hoy se hace desde
+Egestia. El SDK no lo inventa.
+
+### El scope
+
+Emitir facturas de compra necesita el scope **`compras`**. Va aparte de
+`documents` por la misma razón que `honorarios`: esto no factura una venta, crea
+una deuda y un crédito fiscal.
+
 ## Cuando algo falla, el SDK te dice qué pasó
 
 Hay dos formas de trabajar. La que **no lanza** es la recomendada para procesar
@@ -481,9 +613,11 @@ await egestia.stock.liberar({ reference: pedido.id });   // si el pago no se con
 
 La key necesita el scope de cada cosa: `documents` para emitir, consultar y
 anular boletas y facturas; `honorarios` para las boletas de honorarios de
-terceros; `read` para el catálogo; `write` para stock y productos. Una key con
-`write` puede todo.
+terceros; `compras` para las facturas de compra por servicios del exterior;
+`read` para el catálogo; `write` para stock y productos. Una key con `write`
+puede todo.
 
-`honorarios` va aparte de `documents` a propósito: emitir por cuenta de un
-prestador retiene plata que la empresa entera al SII, y eso no debería venir de
-regalo con el permiso de facturar.
+`honorarios` y `compras` van aparte de `documents` a propósito: emitir por cuenta
+de un prestador retiene plata que la empresa entera al SII, y una factura de
+compra además crea una deuda y un crédito fiscal. Nada de eso debería venir de
+regalo con el permiso de facturar una venta.

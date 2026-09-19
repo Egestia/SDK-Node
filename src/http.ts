@@ -25,7 +25,7 @@ export interface PeticionOpciones {
   crudo?: boolean;
 }
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 const esperar = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
